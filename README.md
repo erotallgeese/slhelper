@@ -56,3 +56,4 @@ TBD
 * <https://softlayer.github.io/reference/>
 * <https://softlayer.github.io/python>
 * <https://softlayer.github.io/blog/bpotter/going-further-softlayer-api-python-client-part-1/>
+* <https://softlayer-python.readthedocs.io/en/latest/api/client.html>

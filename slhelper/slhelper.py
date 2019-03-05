@@ -7,8 +7,10 @@ import os
 import requests
 import re
 import datetime
-import dateutil.parser
+from dateutil.parser import parse as dateparser
+from dateutil.relativedelta import relativedelta
 import sys
+import pathlib
 
 # helper class to get info from IBM Softlayer
 class slhelper:
@@ -492,3 +494,181 @@ class slhelper:
             return {'error': 'Unable to Add key'}
 
         return {'id': result['id'], 'privatekey': key.exportKey('PEM').decode()}
+
+    def getBrandAllOwnedAccounts(self, needInvoice=True):
+        # test
+        return self.__getThisAccounts()
+
+        # get all brands, suppose there is one brand for now.
+        ownedBrands = self.client["SoftLayer_Account"].getOwnedBrands()
+        assert(len(ownedBrands) == 1)
+        for brand in ownedBrands:
+            # retrieve all accounts under this brand
+            # i have no idea why, but this filter could be used to reduce recursive inner allOwnedAccounts
+            brandFilter = { 'allOwnedAccounts': {} }
+            # it seems like that it's not be able to get SoftLayer_Account from brand apikey, so we need add the mask for invoice info.
+            # also, it seems not be able to filter for 'typeCode' for invoices.
+            brandMask = None
+            if needInvoice == True:
+                brandMask = 'mask[invoices]'
+            allOwnedAccounts = self.client["SoftLayer_Brand"].getAllOwnedAccounts(id=brand['id'], filter=brandFilter, mask=brandMask)
+        return allOwnedAccounts
+
+    # this api is used for test to let its behavior is simular to getBrandAllOwnedAccounts
+    def __getThisAccounts(self):
+        accountList = []
+        accountMask = "mask[invoices]"
+        accountList.append(self.client["SoftLayer_Account"].getObject(mask=accountMask))
+        return accountList
+
+    def downloadInvoicePdf(self, invoiceId, path=''):
+        ret = { 'err': '', 'fileName': '' }
+        try:
+            pdfFilename = self.client["SoftLayer_Billing_Invoice"].getPdfFilename(id=invoiceId)
+            fName = os.path.join(path, pdfFilename)
+            pdf = self.client["SoftLayer_Billing_Invoice"].getPdf(id=invoiceId)
+            with open(fName, "wb") as pdfFile:
+                pdfFile.write(pdf.data)
+            ret['fileName'] = pdfFilename
+        except:
+            ret['err'] = sys.exc_info()[0]
+            #print("downloadInvoicePdf Unexpected error:", ret['err'])
+        return ret
+
+    def downloadInvoicePdfDetailed(self, invoiceId, path=''):
+        ret = { 'err': '', 'fileName': '' }
+        try:
+            pdfDetailedFilename = self.client["SoftLayer_Billing_Invoice"].getPdfDetailedFilename(id=invoiceId)
+            fName = os.path.join(path, pdfDetailedFilename)
+            pdf = self.client["SoftLayer_Billing_Invoice"].getPdfDetailed(id=invoiceId)
+            with open(fName, "wb") as pdfFile:
+                pdfFile.write(pdf.data)
+            ret['fileName'] = pdfDetailedFilename
+        except:
+            ret['err'] = sys.exc_info()[0]
+            #print("downloadInvoicePdfDetailed Unexpected error:", ret['err'])
+        return ret
+
+    def downloadInvoiceExcel(self, invoiceId, path=''):
+        ret = { 'err': '', 'fileName': '' }
+        try:
+            xlsFilename = self.client["SoftLayer_Billing_Invoice"].getXlsFilename(id=invoiceId)
+            fName = os.path.join(path, xlsFilename)
+            pdf = self.client["SoftLayer_Billing_Invoice"].getExcel(id=invoiceId)
+            with open(fName, "wb") as pdfFile:
+                pdfFile.write(pdf.data)
+            ret['fileName'] = xlsFilename
+        except:
+            ret['err'] = sys.exc_info()[0]
+            #print("downloadInvoiceExcel Unexpected error:", ret['err'])
+        return ret
+
+    # get recurring report by input month
+    def getRecurringInvoice(self, date=None, downloadReport=False, reportPath=''):
+        ret = {
+            'account': '',
+            'accountId': '',
+            'invoiceId': [],
+            'pdfReport': [],
+            'pdfDetailReport': [],
+            'excelReport': [],
+            'err': [],
+            'totalAmount': 0.0,
+        }
+        for account in self.getBrandAllOwnedAccounts():
+            print('>> account: {} ({})'.format(account['companyName'], account['id']))
+            ret['account'] = account['companyName']
+            ret['accountId'] = account['id']
+            # there may exist multiple recurring invoice in one month, so it need add up all those invoices?
+            totalAmount = 0.0
+            for invoice in account['invoices']:
+                createDate = dateparser(invoice['createDate']).astimezone() # convert to utc time
+                if invoice['typeCode'] == 'RECURRING':  # filter for recurring type
+                    if date == None or (createDate.year == date.year and createDate.month == date.month):   # filter by date
+                        print('>>>> invoice: {} ({})'.format(invoice['id'], createDate.strftime('%Y-%m-%d')))
+                        ret['invoiceId'].append(invoice['id'])
+                        
+                        # get SoftLayer_Billing_Invoice
+                        invoiceTotalAmount = float(self.client["SoftLayer_Billing_Invoice"].getInvoiceTotalAmount(id=invoice['id']))
+                        print('>>>> sub total amount: {}'.format(invoiceTotalAmount))
+                        totalAmount += invoiceTotalAmount
+
+                        # debug
+                        # print(invoice)
+
+                        # download the report
+                        if downloadReport == True:
+                            # I can't tell why some pdf summary may not exist and it would raise exception in certain case; details version seems always exist.
+                            d1 = self.downloadInvoicePdf(invoice['id'], reportPath) # same as pdf summary from portal site
+                            if len(d1['fileName']) > 0:
+                                print('>>>> PDF invoice: {}'.format(d1['fileName']))
+                                ret['pdfReport'].append(d1['fileName'])
+                            else:
+                                print('>>>> get PDF invoice failed: {}'.format(d1['err']))
+                                ret['err'].append(d1['err'])
+                            d2 = self.downloadInvoicePdfDetailed(invoice['id'], reportPath) # same as pdf details from portal site
+                            if len(d2['fileName']) > 0:
+                                print('>>>> PDF invoice details: {}'.format(d2['fileName']))
+                                ret['pdfDetailReport'].append(d2['fileName'])
+                            else:
+                                print('>>>> get PDF invoice details failed: {}'.format(d2['err']))
+                                ret['err'].append(d2['err'])
+                            d3 = self.downloadInvoiceExcel(invoice['id'], reportPath)   # same as excel from portal site (it's the most viewable version with details)
+                            if len(d3['fileName']) > 0:
+                                print('>>>> Excel invoice: {}'.format(d3['fileName']))
+                                ret['excelReport'].append(d3['fileName'])
+                            else:
+                                print('>>>> get Excel invoice failed: {}'.format(d3['err']))
+                                ret['err'].append(d3['err'])
+
+                        '''
+                        # list items
+                        # The item is base components (i.e. flavor vm set would divided into different invoice items: cpu, ran and disk ...)
+                        # It's very hard to resample these data as vm flavor based.
+                        # Also, it's hard to identiy each component's usage in it, because of poor documents. So this part is been skipped for now ...
+                        # It seem like that there is no method to retrieve more usage details in this invoice item, where the result should be as same as above pdf/excel report.
+                        getItemMask = 'mask[location,billingItem,category,product]'
+                        getItemFilter = { 'items': {} }
+                        items = self.client["SoftLayer_Billing_Invoice"].getItems(id=invoice['id'], mask=getItemMask, filter=getItemFilter, iter=True)
+                        ti = 0
+                        for item in items:
+                            print('>>>> debug items ({}): {}'.format(ti, json.dumps(item)))
+                            ti = ti + 1
+                        '''
+
+            print('>> total amount: {}'.format(totalAmount))
+            ret['totalAmount'] = totalAmount
+
+        return ret
+
+    # What we need is to collect one final invoice for last month, but their design is based on each invoice items.
+    # (e.g. there would mutiple invoice items for one month)
+    # It seems like createDate is the only key to filter for invoice date...
+    # Suppose recurring invoice created in this month means it's used at last month.
+    def getLastRecurringInvoice(self, downloadReport=False, reportPath=''):
+        currentDay = datetime.datetime.utcnow().date()
+        print('== get last invoice at {}'.format(currentDay.strftime('%Y-%m')))
+        return self.getRecurringInvoice(currentDay, downloadReport, reportPath)
+
+    def getNextInvoice(self, downloadReport=False, reportPath=''):
+        ret = {
+            'account': '',
+            'accountId': '',
+            'invoiceId': [],
+            'pdfReport': [],
+            'pdfDetailReport': [],
+            'excelReport': [],
+            'err': [],
+            'totalAmount': 0.0,
+        }
+        for account in self.getBrandAllOwnedAccounts(False):
+            print('>> account: {} ({})'.format(account['companyName'], account['id']))
+            ret['account'] = account['companyName']
+            ret['accountId'] = account['id']
+            
+            # todo ...
+            # for now, it's unable to get account info from brand account
+            nextInvoiceTotalAmount = self.client["SoftLayer_Account"].getNextInvoiceTotalAmount(id=account['id'])
+            print('>>>> next total amount: {}'.format(nextInvoiceTotalAmount))
+
+        return ret
