@@ -11,6 +11,15 @@ from dateutil.parser import parse as dateparser
 from dateutil.relativedelta import relativedelta
 import sys
 import pathlib
+import time
+import logging
+
+def getDescription(categoryCode, detail):
+    for item in detail:
+        if 'categoryCode' in item:
+            if item['categoryCode']==categoryCode:
+                return item['description']
+    return "Not Found"
 
 # helper class to get info from IBM Softlayer
 class slhelper:
@@ -496,8 +505,8 @@ class slhelper:
         return {'id': result['id'], 'privatekey': key.exportKey('PEM').decode()}
 
     def getBrandAllOwnedAccounts(self, needInvoice=True):
-        # test
-        return self.__getThisAccounts()
+        # test, serve as standalone account but brand
+        #return self.__getThisAccounts()
 
         # get all brands, suppose there is one brand for now.
         ownedBrands = self.client["SoftLayer_Account"].getOwnedBrands()
@@ -635,6 +644,120 @@ class slhelper:
                             print('>>>> debug items ({}): {}'.format(ti, json.dumps(item)))
                             ti = ti + 1
                         '''
+
+                        #print ()
+                        #print ('{:<35} {:<15} {:<15} {:>8} {:>16} {:>16} {:>16} {:<15}'.format("Invoice Date /", "Account", "Invoice", " ", "Items", "Recurring Charge",  "Invoice Amount", "Type"))
+                        #print ('{:<35} {:<15} {:<15} {:>8} {:>16} {:>16} {:>16} {:<15}'.format("==============", "=======", "=======", " ", "=====", "================",  "==============", "===="))
+                        #for invoice in account['invoices']:
+                        invoiceId = invoice['id']
+                        getItemMask = 'accountId,id,createDate,typeCode,invoiceTotalAmount,invoiceTotalRecurringAmount,invoiceTopLevelItemCount'
+                        invoiceInfo = self.client['Billing_Invoice'].getObject(id=invoiceId, mask=getItemMask)
+                        accountId = invoiceInfo['accountId']
+                        invoiceDate = invoiceInfo['createDate'][0:10]
+                        invoiceTotalAmount = float(invoiceInfo['invoiceTotalAmount'])
+                        invoiceTotalRecurringAmount = float(invoiceInfo['invoiceTotalRecurringAmount'])
+                        invoiceType = invoiceInfo['typeCode']
+                        totalItems=invoiceInfo['invoiceTopLevelItemCount']
+
+                        print('{:35} {:<15} {:<15} {:>8} {:>16} {:>16,.2f} {:>16,.2f} {:<15}'.format(invoiceDate,
+                                                                                accountId, invoiceId, " ",
+                                                                                totalItems,
+                                                                                invoiceTotalAmount,
+                                                                                invoiceTotalRecurringAmount, invoiceType))
+
+                        limit = 10 ## set limit of record t
+                        for offset in range(0,totalItems,limit):
+                            print ("Lookup at Offset %s" % offset)
+                            time.sleep(1)
+                            Billing_Invoice = self.client['Billing_Invoice'].getInvoiceTopLevelItems(id=invoiceId, limit=limit, offset=offset,
+                                                    mask='id, billingItemId, categoryCode, hostName, domainName, description, createDate, totalRecurringAmount,hourlyRecurringFee')
+                            #print(json.dumps(Billing_Invoice))
+                            count=0
+                            # ITERATE THROUGH DETAIL
+                            for item in Billing_Invoice:
+                                billingItemId = item['billingItemId']
+                                category = item["categoryCode"]
+
+                                if 'hostName' in item:
+                                    hostName = item['hostName']+"."+item['domainName']
+                                else:
+                                    hostName = "Unnamed Device"
+
+                                recurringFee = float(item['totalRecurringAmount'])
+
+                                #IF Monthly calculate hourly rate and total hours
+                                if 'hourlyRecurringFee' in item:
+                                    instanceType = "Hourly"
+                                    associated_children=""
+                                    hourlyRecurringFee=0
+                                    while associated_children is "":
+                                        try:
+                                            time.sleep(0.5)
+                                            associated_children = self.client['Billing_Invoice_Item'].getNonZeroAssociatedChildren(id=item['id'],mask="hourlyRecurringFee")
+                                        except SoftLayer.SoftLayerAPIError as e:
+                                            logging.warning("getNonZeroAssociatedChildren(): %s, %s" % (e.faultCode, e.faultString))
+                                            time.sleep(5)
+                                    #calculate total hourlyRecurringFree from associated childrent
+
+                                    for child in associated_children:
+                                        if child:
+                                            hourlyRecurringFee = float(item['hourlyRecurringFee'])
+                                            if isinstance(child['hourlyRecurringFee'], list):
+                                                hourlyRecurringFee += sum(float(child['hourlyRecurringFee']))
+                                            else:
+                                                hourlyRecurringFee += float(child['hourlyRecurringFee'])
+                                    if hourlyRecurringFee > 0:
+                                        hours = round(float(recurringFee) / hourlyRecurringFee)
+                                    else:
+                                        hours=0
+                                else:
+                                    instanceType = "Monthly/Other"
+                                    hourlyRecurringFee = 0
+                                    hours = 0
+
+                                if category=="storage_service_enterprise" or category=="performance_storage_iscsi":
+                                    billing_detail=""
+                                    while billing_detail is "":
+                                        try:
+                                            time.sleep(1)
+                                            billing_detail = self.client['Billing_Invoice_Item'].getChildren(id=item['id'], mask="description,categoryCode,product")
+                                        except SoftLayer.SoftLayerAPIError as e:
+                                            logging.warning("%s, %s" % (e.faultCode, e.faultString))
+
+                                    if category=="storage_service_enterprise":
+                                        iops=getDescription("storage_tier_level", billing_detail)
+                                        storage=getDescription("performance_storage_space",billing_detail)
+                                        snapshot=getDescription("storage_snapshot_space", billing_detail)
+                                        if snapshot=="Not Found":
+                                            description=storage+" "+iops+" "
+                                        else:
+                                            description=storage+" "+iops+" with "+snapshot
+                                    else:
+                                        iops=getDescription("performance_storage_iops", billing_detail)
+                                        storage=getDescription("performance_storage_space", billing_detail)
+                                        description=storage+" "+iops
+                                else:
+                                    description=item['description']
+                                    description = description.replace('\n', " ")
+                                # BUILD CSV OUTPUT & WRITE ROW
+                                row = {'Invoice_Date': invoiceDate,
+                                    'Account_Id': accountId,
+                                    'Invoice_Number': invoiceId,
+                                    'BillingItemId': billingItemId,
+                                    'InstanceType': instanceType,
+                                    'hostName': hostName,
+                                    'Category': category,
+                                    'Description': description,
+                                    'Hours': hours,
+                                    'Hourly_Rate': round(hourlyRecurringFee,3),
+                                    'RecurringCharge': round(recurringFee,2),
+                                    'InvoiceTotal': invoiceTotalAmount,
+                                    'InvoiceRecurring': invoiceTotalRecurringAmount,
+                                    'Type': invoiceType
+                                        }
+                                #csvwriter.writerow(row)
+                                print(row)
+
 
             print('>> total amount: {}'.format(totalAmount))
             ret['totalAmount'] = totalAmount
